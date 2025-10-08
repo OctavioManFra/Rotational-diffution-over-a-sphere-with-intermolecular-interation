@@ -1,0 +1,223 @@
+using JLD2
+using Distributed
+using DelimitedFiles
+using Plots
+addprocs()
+@everywhere using LinearAlgebra
+@everywhere using LegendrePolynomials  
+@everywhere using StatsBase
+
+##
+###########  Sección para crear los polinomios de legendre  ########## 
+
+
+tiempo_polinomios = @elapsed begin
+
+    mpx = 100000              # Numero de pasos en [-1, 0] y [0, 1]
+
+    npx = 2*mpx+1             # Numero de pasos totales 2*n+1 para incluir el 0 
+
+    nlg = 700                 # Orden de los polinomios
+
+    P = zeros((nlg,npx))      # Se define una matriz de polinomios de dimensión (N, npx)
+
+    x = range(-1,1,npx)       # Vector de posición
+
+    dx = 2/npx                # Tamaño de paso
+
+    P[1,:] .= 1.0             # Polinomio de orden P_0[x]
+
+    P[2,:] .= x               # Polinomio de orden P_1[x]
+
+    # Ciclo para aumentar el orden del polinomio
+
+    for n in 1:nlg-2
+
+        P[n+2,:] = ( ( 2 * n + 1 ) .* x .* P[n+1,:] - n .* P[n,:] ) / ( n + 1 )
+
+    end
+
+end
+println("Tiempo de cálculo de los polinomios: $tiempo_polinomios")
+
+
+
+##
+###########  Función que calcula por 3 metrodos la función de distribución radial
+
+
+@everywhere function g_theta_parallel(l_max, taus, constantes_sim, zta_p, R2, M_in, tau_max)
+
+    EN, N, M = Int(constantes_sim[1]), Int(constantes_sim[2]), Int(constantes_sim[4])
+    
+
+    function process_t(ti, ris, rjs)
+
+        # Inicializar variables
+        bins = range(-1, 1, zta_p + 1)
+        hl1_temp_diff = zeros(1, l_max)                 # Coeficientes temporales
+        hl1_temp_self = zeros(1, l_max)                 # Coeficientes temporales
+        hist_diff = fit(Histogram, Float64[], bins)     # Histograma vacío
+        hist_self = fit(Histogram, Float64[], bins)     # Histograma vacío
+        epsilon = 1e-14                                 # Tolerancia para evitar errores numéricos
+    
+        # Calcular productos punto para partículas diferentes
+        for i in 1:N-1
+            for j in i+1:N
+                dot_product = dot(ris[ti, i, :], rjs[ti, j, :]) / R2
+                if -1.0 - epsilon < dot_product < 1.0 + epsilon
+                    dot_product = clamp(dot_product, -1.0, 1.0)     # Asegurar que esté en el rango [-1, 1]
+                    push!(hist_diff, dot_product)                   # Agregar al histograma
+                    hl1_temp_diff[1, :] .+= 2 .* collect(collectPl(dot_product, lmax = l_max - 1))
+                end
+            end
+        end
+
+        for i in 1:N
+            # Calcular producto punto para partículas iguales
+            dot_product = dot(ris[ti, i, :], rjs[ti, i, :]) / R2
+
+            if -1.0 - epsilon < dot_product < 1.0 + epsilon
+                dot_product = clamp(dot_product, -1.0, 1.0)     # Asegurar que esté en el rango [-1, 1]
+                push!(hist_self, dot_product)                   # Agregar al histograma
+                hl1_temp_self[1, :] .+= collect(collectPl(dot_product, lmax = l_max - 1))
+            end
+        end
+
+        return hist_self.weights, hist_diff.weights, hl1_temp_self, hl1_temp_diff
+
+    end 
+
+    for t in eachindex(taus)
+
+        local tau, coeficint, polinomio, histogram, coef_diff, coef_self, poli_diff, poli_self, hist_diff, hist_self
+        local hl_diff, hl_self, g_theta_diff, g_theta_self, fl_diff, fl_self, g_theta
+
+        hl_diff = zeros(1, l_max)
+        hl_self = zeros(1, l_max)
+        fl_diff = zeros(1, l_max)
+        fl_self = zeros(1, l_max)
+        g_theta_diff = zeros(zta_p)
+        g_theta_self = zeros(zta_p)
+        hl = zeros(1, l_max)
+        fl = zeros(1, l_max)
+        g_theta = zeros(zta_p)
+
+        tau = taus[t]
+        
+        println("tau = $(taus[t])")
+
+        for en in 1:EN
+
+            prtcn = 10
+
+            println(Int(M_in/prtcn + 1) : Int((M - tau_max)/prtcn))
+
+            for m in Int(M_in/prtcn + 1) : Int((M - tau_max)/prtcn) 
+                
+                
+                local partial_results1, ris, rjs
+
+                tiempo = 1:prtcn
+                
+                # Sumar los resultados parciales de `process_ij_dots`
+                ris = rit[en, ((m-1)*prtcn + tau):((m-1)*prtcn + prtcn + tau), :, :]
+                rjs = rit[en, ((m-1)*prtcn):((m-1)*prtcn + prtcn), :, :]
+
+
+
+                partial_results1 = pmap(ms -> process_t(ms, ris, rjs), tiempo)
+
+                for res in partial_results1
+
+                    g_theta_diff[:] += res[1]
+                    g_theta_self[:] += res[2]
+                    hl_self[:, :] += res[3]
+                    hl_diff[:, :] += res[4]
+
+                end
+
+                partial_results1 = nothing
+
+            end
+
+        end
+
+        # Normalizar resultados
+
+        hl_diff[:, :] /= ( ( M - M_in - tau_max + 1) * EN )
+        hl_self[:, :] /= ( ( M - M_in - tau_max + 1) * EN )
+
+        fl_diff[1, :] = hl_diff[1, :] 
+        fl_self[1, :] = hl_self[1, :]
+        fl[:, :] = fl_diff[1, :] + fl_self[1, :]
+        
+        hl[1, 1] = (fl[1, 1] - fl_self[1, 1]) / (N^2) - 1
+        hl_self[1, 1] =  ( ( hl_self[1, 1] ) / (N^2)) - 1
+
+        for l in 2:l_max
+            hl_self[1, l] = (2 * (l - 1) + 1) * ((hl_self[1, l]) / (N^2))
+            hl[1, l] = (2 * (l - 1) + 1) * ((fl[1, l] .- fl_self[1, l]) / (N^2))
+        end
+       
+        A1 = 1 / ((1 / (zta_p - 1)) * (N^2) * (M - M_in - tau_max + 1) * EN)
+        A2 = 2 / ((1 / (zta_p - 1)) * (N^2) * (M - M_in - tau_max + 1) * EN)
+        
+        g_theta_self[:] = reverse(g_theta_self[:]) .* A1
+        g_theta_diff[:] = reverse(g_theta_diff[:]) .* A2
+        
+        g_theta[:] = g_theta_self[:] .+ g_theta_diff[:]
+
+        histogram = cat(zta1, g_theta[:], dims=2)
+        hist_diff = cat(zta1, g_theta_diff[:], dims=2)
+        hist_self = cat(zta1, g_theta_self[:], dims=2)
+
+        writedlm("datos_jld1/datos_N"*string(N)*"/resultado_N"*string(N)*"/resultado_k"*string(k1)*"histogram$(tau_var[t]).csv", histogram , ',')
+        writedlm("datos_jld1/datos_N"*string(N)*"/resultado_N"*string(N)*"/resultado_k"*string(k1)*"hist_diff$(tau_var[t]).csv", hist_diff , ',')
+        writedlm("datos_jld1/datos_N"*string(N)*"/resultado_N"*string(N)*"/resultado_k"*string(k1)*"hist_self$(tau_var[t]).csv", hist_self , ',')
+        writedlm("datos_jld1/datos_N"*string(N)*"/resultado_N"*string(N)*"/resultado_k"*string(k1)*"fl_self_t$(tau_var[t]).csv", cat(range(1,l_max) , fl_self[1,:] , dims = 2 ) , ',')
+        writedlm("datos_jld1/datos_N"*string(N)*"/resultado_N"*string(N)*"/resultado_k"*string(k1)*"fl_diff_t$(tau_var[t]).csv", cat(range(1,l_max) , fl_diff[1,:] , dims = 2 ) , ',')
+        writedlm("datos_jld1/datos_N"*string(N)*"/resultado_N"*string(N)*"/resultado_k"*string(k1)*"fl_t$(tau_var[t]).csv", cat(range(1,l_max) , fl[1,:] , dims = 2 ) , ',')
+
+    end
+
+end
+
+
+ 
+
+###########  Cargar y definir los parámetros del histograma y el caso de simulacion  #########
+
+N = 40
+
+k1 = 1
+
+EN = 100
+
+M = 1502000
+
+zta_p = 1000
+
+tau_var = [0,1,2,5,10,20,50,100,200,500,1000,2000,5000,10000,20000,50000,100000,200000,500000]
+
+l_max = 600
+
+M_inicio = 2000
+
+tau_maximo = 500000
+
+name = "datos_jld1/datos_N"*string(N)*"/N"*string(N)*"_k"*string(k1)*"_random_M"*string(M)*"_EN"*string(EN)*".jld2"
+
+@load name rit constantes_sim
+
+R , M , Ms , D0dt , phi_p, R2 =  constantes_sim[3],  Int(constantes_sim[4]), Int(constantes_sim[5]), constantes_sim[6], 8, constantes_sim[3]^2
+
+##########  Ejecución del código  ########## 
+
+tiempo_total = @elapsed begin
+
+    g_theta_parallel(l_max,tau_var,constantes_sim,zta_p,R2,M_inicio,tau_maximo)
+
+end
+
+println("Tiempo total de ejecución: $tiempo_total")
